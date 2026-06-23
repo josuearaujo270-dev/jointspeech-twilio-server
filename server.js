@@ -69,6 +69,7 @@ wss.on('connection', (twilioWs) => {
   let callSid = null;
   let streamSid = null;
   let deepgramWs = null;
+  let mediaCount = 0;
 
   twilioWs.on('message', async (raw) => {
     const msg = JSON.parse(raw.toString());
@@ -87,6 +88,7 @@ wss.on('connection', (twilioWs) => {
       deepgramWs.on('message', async (dgRaw) => {
         try {
           const dgMsg = JSON.parse(dgRaw.toString());
+          console.log(`[${callSid}] Deepgram raw: ${dgRaw.toString().slice(0, 300)}`);
           if (dgMsg.type !== 'Results') return;
           const transcript = dgMsg.channel?.alternatives?.[0]?.transcript || '';
           const isFinal = dgMsg.is_final;
@@ -123,9 +125,14 @@ wss.on('connection', (twilioWs) => {
       console.log(`[${callSid}] Call started, streamSid=${streamSid}`);
     }
 
-    if (msg.event === 'media' && deepgramWs && deepgramWs.readyState === 1) {
-      const audioChunk = Buffer.from(msg.media.payload, 'base64');
-      deepgramWs.send(audioChunk);
+    if (msg.event === 'media') {
+      if (!mediaCount) mediaCount = 0;
+      mediaCount++;
+      if (mediaCount % 50 === 0) console.log(`[${callSid}] Received ${mediaCount} media chunks, deepgram readyState=${deepgramWs?.readyState}`);
+      if (deepgramWs && deepgramWs.readyState === 1) {
+        const audioChunk = Buffer.from(msg.media.payload, 'base64');
+        deepgramWs.send(audioChunk);
+      }
     }
 
     if (msg.event === 'stop') {
