@@ -78,7 +78,7 @@ wss.on('connection', (twilioWs) => {
       callSid = msg.start.callSid;
       streamSid = msg.start.streamSid;
 
-      const dgUrl = 'wss://api.deepgram.com/v1/listen?model=nova-2&encoding=mulaw&sample_rate=8000&language=multi&interim_results=true&punctuate=true&endpointing=800';
+      const dgUrl = 'wss://api.deepgram.com/v1/listen?model=nova-2&encoding=mulaw&sample_rate=8000&channels=1&multichannel=false&language=multi&interim_results=true&punctuate=true&endpointing=800';
       deepgramWs = new (await import('ws')).WebSocket(dgUrl, ['token', DEEPGRAM_API_KEY]);
 
       deepgramWs.on('open', () => {
@@ -128,9 +128,12 @@ wss.on('connection', (twilioWs) => {
     if (msg.event === 'media') {
       if (!mediaCount) mediaCount = 0;
       mediaCount++;
-      if (mediaCount % 50 === 0) console.log(`[${callSid}] Received ${mediaCount} media chunks, deepgram readyState=${deepgramWs?.readyState}`);
       if (deepgramWs && deepgramWs.readyState === 1) {
         const audioChunk = Buffer.from(msg.media.payload, 'base64');
+        if (mediaCount % 50 === 0) {
+          const isAllSilence = audioChunk.every((b) => b === 0xff || b === 0x7f);
+          console.log(`[${callSid}] Chunk ${mediaCount}: ${audioChunk.length} bytes, first10=[${audioChunk.slice(0, 10).join(',')}], allSilence=${isAllSilence}`);
+        }
         deepgramWs.send(audioChunk);
       }
     }
