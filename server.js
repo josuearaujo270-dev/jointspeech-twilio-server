@@ -189,14 +189,22 @@ wss.on('connection', (twilioWs) => {
 
       deepgramWs.on('error', (err) => console.error(`[${callSid}] Deepgram error`, err));
 
-      activeCalls.set(callSid, {
-        twilioWs,
-        streamSid,
-        startedAt: Date.now(),
-        languageCode: null,
-        languageName: null,
-        transcriptLog: [],
-      });
+      // Preserve transcript history if this callSid somehow gets a second "start"
+      // event (e.g. a media stream reconnect) instead of wiping it clean.
+      const existingCall = activeCalls.get(callSid);
+      if (existingCall) {
+        existingCall.twilioWs = twilioWs;
+        existingCall.streamSid = streamSid;
+      } else {
+        activeCalls.set(callSid, {
+          twilioWs,
+          streamSid,
+          startedAt: Date.now(),
+          languageCode: null,
+          languageName: null,
+          transcriptLog: [],
+        });
+      }
       console.log(`[${callSid}] Call started, streamSid=${streamSid}`);
     }
 
