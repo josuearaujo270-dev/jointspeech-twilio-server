@@ -131,10 +131,26 @@ app.post('/speak/:callSid', async (req, res) => {
 });
 
 const server = http.createServer(app);
-const wss = new WebSocketServer({ server, path: '/media' });
+
+// Two WS paths share this HTTP server (Twilio's media stream + the agent dashboard's
+// listen-live stream). Attaching multiple `{ server, path }` WebSocketServer instances
+// directly can corrupt frames on the other path, so both run in noServer mode and we
+// route the single 'upgrade' event manually — the pattern the ws library itself recommends.
+const wss = new WebSocketServer({ noServer: true, perMessageDeflate: false });
+const listenWss = new WebSocketServer({ noServer: true, perMessageDeflate: false });
+
+server.on('upgrade', (req, socket, head) => {
+  const { pathname } = new URL(req.url, 'http://internal');
+  if (pathname === '/media') {
+    wss.handleUpgrade(req, socket, head, (ws) => wss.emit('connection', ws, req));
+  } else if (pathname === '/listen') {
+    listenWss.handleUpgrade(req, socket, head, (ws) => listenWss.emit('connection', ws, req));
+  } else {
+    socket.destroy();
+  }
+});
 
 // ── Agent dashboard: listen live to a call's raw audio (one-way, no agent mic) ──
-const listenWss = new WebSocketServer({ server, path: '/listen' });
 listenWss.on('connection', (listenerWs, req) => {
   const callSid = new URL(req.url, 'http://internal').searchParams.get('callSid');
   const call = callSid ? activeCalls.get(callSid) : null;
