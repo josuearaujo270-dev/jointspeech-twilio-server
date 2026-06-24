@@ -133,6 +133,19 @@ app.post('/speak/:callSid', async (req, res) => {
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server, path: '/media' });
 
+// ── Agent dashboard: listen live to a call's raw audio (one-way, no agent mic) ──
+const listenWss = new WebSocketServer({ server, path: '/listen' });
+listenWss.on('connection', (listenerWs, req) => {
+  const callSid = new URL(req.url, 'http://internal').searchParams.get('callSid');
+  const call = callSid ? activeCalls.get(callSid) : null;
+  if (!call) {
+    listenerWs.close(4404, 'Call not found or already ended');
+    return;
+  }
+  call.listeners.add(listenerWs);
+  listenerWs.on('close', () => call.listeners.delete(listenerWs));
+});
+
 wss.on('connection', (twilioWs) => {
   let callSid = null;
   let streamSid = null;
@@ -214,6 +227,7 @@ wss.on('connection', (twilioWs) => {
           languageName: null,
           fromNumber: meta?.fromNumber || null,
           transcriptLog: [],
+          listeners: new Set(),
         });
       }
       console.log(`[${callSid}] Call started, streamSid=${streamSid}`);
@@ -222,6 +236,14 @@ wss.on('connection', (twilioWs) => {
     if (msg.event === 'media') {
       if (deepgramWs && deepgramWs.readyState === 1) {
         deepgramWs.send(Buffer.from(msg.media.payload, 'base64'));
+      }
+      // Relay the same raw call audio to any agents listening live in the dashboard
+      const call = activeCalls.get(callSid);
+      if (call && call.listeners.size) {
+        const payload = JSON.stringify({ event: 'media', payload: msg.media.payload });
+        for (const listenerWs of call.listeners) {
+          if (listenerWs.readyState === 1) listenerWs.send(payload);
+        }
       }
     }
 
@@ -246,6 +268,10 @@ async function finalizeCall(callSid) {
   const call = activeCalls.get(callSid);
   if (!call) return;
   activeCalls.delete(callSid);
+
+  for (const listenerWs of call.listeners) {
+    try { listenerWs.close(4410, 'Call ended'); } catch {}
+  }
 
   if (!APP_CALLBACK_URL || call.transcriptLog.length === 0) return;
 
