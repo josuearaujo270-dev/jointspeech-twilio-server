@@ -8,6 +8,7 @@ const DEEPGRAM_API_KEY = process.env.DEEPGRAM_API_KEY;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY;
 const PUBLIC_HOST = process.env.PUBLIC_HOST; // e.g. jointspeech-twilio.up.railway.app
+const APP_CALLBACK_URL = process.env.APP_CALLBACK_URL; // e.g. https://jointspeech.com/api/twilio/save-call
 
 const LANGUAGE_NAMES = {
   en: 'English', es: 'Spanish', fr: 'French', pt: 'Portuguese', zh: 'Chinese',
@@ -29,11 +30,18 @@ app.use((req, res, next) => {
 app.use(express.urlencoded({ extended: false }));
 app.use(express.json());
 
-// callSid -> { twilioWs, streamSid, startedAt, languageCode, languageName, transcriptLog: [] }
+// callSid -> { twilioWs, streamSid, startedAt, languageCode, languageName, fromNumber, transcriptLog: [] }
 const activeCalls = new Map();
+
+// callSid -> { fromNumber } — captured from the /voice webhook before the media stream's
+// "start" event arrives, then merged into activeCalls once we have a WS connection for it.
+const pendingCallMeta = new Map();
 
 // ── Twilio webhook: answers the call, opens a bidirectional media stream ──
 app.post('/voice', (req, res) => {
+  if (req.body?.CallSid) {
+    pendingCallMeta.set(req.body.CallSid, { fromNumber: req.body.From || null });
+  }
   const wsUrl = `wss://${PUBLIC_HOST}/media`;
   res.type('text/xml');
   res.send(`<?xml version="1.0" encoding="UTF-8"?>
@@ -196,12 +204,15 @@ wss.on('connection', (twilioWs) => {
         existingCall.twilioWs = twilioWs;
         existingCall.streamSid = streamSid;
       } else {
+        const meta = pendingCallMeta.get(callSid);
+        pendingCallMeta.delete(callSid);
         activeCalls.set(callSid, {
           twilioWs,
           streamSid,
           startedAt: Date.now(),
           languageCode: null,
           languageName: null,
+          fromNumber: meta?.fromNumber || null,
           transcriptLog: [],
         });
       }
@@ -217,15 +228,44 @@ wss.on('connection', (twilioWs) => {
     if (msg.event === 'stop') {
       console.log(`[${callSid}] Call ended`);
       if (deepgramWs) deepgramWs.close();
-      if (callSid) activeCalls.delete(callSid);
+      finalizeCall(callSid);
     }
   });
 
   twilioWs.on('close', () => {
     if (deepgramWs) deepgramWs.close();
-    if (callSid) activeCalls.delete(callSid);
+    finalizeCall(callSid);
   });
 });
+
+// Saves the finished call to JointSpeech (Supabase) so it shows up in Saved Calls /
+// Memory Library, then removes it from in-memory active-call tracking. Guarded so the
+// "stop" event and the WS "close" event (both of which fire per call) only save once.
+async function finalizeCall(callSid) {
+  if (!callSid) return;
+  const call = activeCalls.get(callSid);
+  if (!call) return;
+  activeCalls.delete(callSid);
+
+  if (!APP_CALLBACK_URL || call.transcriptLog.length === 0) return;
+
+  try {
+    await fetch(APP_CALLBACK_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        callSid,
+        fromNumber: call.fromNumber,
+        languageName: call.languageName,
+        startedAt: call.startedAt,
+        endedAt: Date.now(),
+        transcriptLog: call.transcriptLog,
+      }),
+    });
+  } catch (err) {
+    console.error(`[${callSid}] Failed to save call`, err);
+  }
+}
 
 server.listen(PORT, () => {
   console.log(`JointSpeech Twilio server listening on port ${PORT}`);
