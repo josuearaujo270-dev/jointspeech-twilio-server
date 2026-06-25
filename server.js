@@ -28,6 +28,29 @@ function matchLanguageName(spoken) {
   return null;
 }
 
+// So the customer (not just the rep) understands what's happening — Twilio's own
+// <Say> voices handle this natively, no extra translation API call/latency needed.
+const CUSTOMER_INSTRUCTIONS = {
+  Spanish: { sayLang: 'es-MX', text: 'Por favor hable en oraciones completas. Puede haber un breve retraso mientras traducimos.' },
+  French: { sayLang: 'fr-FR', text: 'Veuillez parler en phrases complètes. Il pourrait y avoir un léger délai pendant la traduction.' },
+  Portuguese: { sayLang: 'pt-BR', text: 'Por favor, fale em frases completas. Pode haver um pequeno atraso durante a tradução.' },
+  Chinese: { sayLang: 'zh-CN', text: '请说完整的句子。翻译时可能会有短暂的延迟。' },
+  Hindi: { sayLang: 'hi-IN', text: 'कृपया पूरे वाक्यों में बोलें। अनुवाद करते समय थोड़ी देरी हो सकती है।' },
+  Arabic: { sayLang: 'ar-XA', text: 'يرجى التحدث بجمل كاملة. قد يكون هناك تأخير قصير أثناء الترجمة.' },
+  Russian: { sayLang: 'ru-RU', text: 'Пожалуйста, говорите полными предложениями. Во время перевода может быть небольшая задержка.' },
+  Japanese: { sayLang: 'ja-JP', text: '完全な文でお話しください。翻訳中に少し遅れが生じる場合があります。' },
+  Korean: { sayLang: 'ko-KR', text: '완전한 문장으로 말씀해 주세요. 번역 중에 약간의 지연이 있을 수 있습니다.' },
+  German: { sayLang: 'de-DE', text: 'Bitte sprechen Sie in vollständigen Sätzen. Es kann zu einer kurzen Verzögerung bei der Übersetzung kommen.' },
+  Italian: { sayLang: 'it-IT', text: 'Si prega di parlare con frasi complete. Potrebbe esserci un breve ritardo durante la traduzione.' },
+  Polish: { sayLang: 'pl-PL', text: 'Proszę mówić pełnymi zdaniami. Podczas tłumaczenia może wystąpić niewielkie opóźnienie.' },
+  Vietnamese: { sayLang: 'vi-VN', text: 'Vui lòng nói thành câu hoàn chỉnh. Có thể có một chút chậm trễ trong khi chúng tôi dịch.' },
+  Turkish: { sayLang: 'tr-TR', text: 'Lütfen tam cümlelerle konuşun. Çeviri sırasında kısa bir gecikme olabilir.' },
+  Romanian: { sayLang: 'ro-RO', text: 'Vă rugăm să vorbiți în propoziții complete. Poate exista o scurtă întârziere în timpul traducerii.' },
+  Dutch: { sayLang: 'nl-NL', text: 'Spreek in volledige zinnen. Er kan een korte vertraging zijn tijdens het vertalen.' },
+  Greek: { sayLang: 'el-GR', text: 'Παρακαλώ μιλήστε με ολόκληρες προτάσεις. Μπορεί να υπάρξει μικρή καθυστέρηση κατά τη μετάφραση.' },
+  Ukrainian: { sayLang: 'uk-UA', text: 'Будь ласка, говоріть повними реченнями. Під час перекладу може бути невелика затримка.' },
+};
+
 const app = express();
 
 // Allow the JointSpeech web app (running on a different domain) to poll these endpoints
@@ -77,13 +100,17 @@ app.post('/voice/language', (req, res) => {
 
   const wsUrl = `wss://${PUBLIC_HOST}/media`;
   const confirmMsg = matchedLang
-    ? `Connecting you now for ${matchedLang}. Please speak in complete sentences.`
-    : `Connecting you now. Please speak in complete sentences.`;
+    ? `Connecting you now for ${matchedLang}. Please speak in complete sentences — there may be a short delay while we translate.`
+    : `Connecting you now. Please speak in complete sentences — there may be a short delay while we translate.`;
+  const customerInstructions = matchedLang ? CUSTOMER_INSTRUCTIONS[matchedLang] : null;
+  const customerSay = customerInstructions
+    ? `\n  <Say language="${customerInstructions.sayLang}">${customerInstructions.text}</Say>`
+    : '';
 
   res.type('text/xml');
   res.send(`<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Say>${confirmMsg}</Say>
+  <Say>${confirmMsg}</Say>${customerSay}
   <Connect>
     <Stream url="${wsUrl}" />
   </Connect>
