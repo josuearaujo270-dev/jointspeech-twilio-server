@@ -55,17 +55,15 @@ app.post('/voice', (req, res) => {
   if (req.body?.CallSid) {
     pendingCallMeta.set(req.body.CallSid, { fromNumber: req.body.From || null });
   }
-  const wsUrl = `wss://${PUBLIC_HOST}/media`;
   res.type('text/xml');
   res.send(`<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Connect>
-    <Stream url="${wsUrl}" />
-  </Connect>
+  <Gather input="speech" speechTimeout="auto" action="/voice/language" method="POST">
+    <Say>JointSpeech connected. Please say the customer's language now.</Say>
+  </Gather>
+  <Redirect method="POST">/voice/language</Redirect>
 </Response>`);
 });
-
-// Kept for later — currently unused while the language IVR step is rolled back.
 
 app.post('/voice/language', (req, res) => {
   const callSid = req.body?.CallSid;
@@ -290,12 +288,14 @@ wss.on('connection', (twilioWs) => {
       if (existingCall) {
         existingCall.twilioWs = twilioWs;
         existingCall.streamSid = streamSid;
+        existingCall.deepgramWs = deepgramWs;
       } else {
         const meta = pendingCallMeta.get(callSid);
         pendingCallMeta.delete(callSid);
         activeCalls.set(callSid, {
           twilioWs,
           streamSid,
+          deepgramWs,
           startedAt: Date.now(),
           languageCode: null,
           languageName: meta?.presetLanguageName || null,
@@ -374,3 +374,23 @@ async function finalizeCall(callSid) {
 server.listen(PORT, () => {
   console.log(`JointSpeech Twilio server listening on port ${PORT}`);
 });
+
+// Railway sends SIGTERM on every redeploy. Without this, in-progress Deepgram
+// connections get abandoned mid-stream instead of closed, which can leave them
+// counted as active on Deepgram's side until they time out on their own.
+function shutdownGracefully(signal) {
+  console.log(`Received ${signal}, closing ${activeCalls.size} active call(s) cleanly...`);
+  for (const call of activeCalls.values()) {
+    try { call.deepgramWs?.close(); } catch {}
+    try { call.twilioWs?.close(); } catch {}
+    for (const listenerWs of call.listeners) {
+      try { listenerWs.close(); } catch {}
+    }
+  }
+  server.close(() => process.exit(0));
+  // Failsafe in case something hangs and close() never fires
+  setTimeout(() => process.exit(0), 2000);
+}
+
+process.on('SIGTERM', () => shutdownGracefully('SIGTERM'));
+process.on('SIGINT', () => shutdownGracefully('SIGINT'));
