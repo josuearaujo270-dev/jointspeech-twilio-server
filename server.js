@@ -67,6 +67,14 @@ app.use(express.json());
 // callSid -> { twilioWs, streamSid, startedAt, languageCode, languageName, fromNumber, transcriptLog: [] }
 const activeCalls = new Map();
 
+// Single-tenant for now — the web app pushes the agent's business context here so phone
+// call translations can use it the same way the main app's translations already do.
+let businessContext = '';
+app.post('/context', (req, res) => {
+  businessContext = typeof req.body?.businessContext === 'string' ? req.body.businessContext : '';
+  res.json({ ok: true });
+});
+
 // callSid -> { fromNumber } — captured from the /voice webhook before the media stream's
 // "start" event arrives, then merged into activeCalls once we have a WS connection for it.
 const pendingCallMeta = new Map();
@@ -158,7 +166,7 @@ app.post('/speak/:callSid', async (req, res) => {
         headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
         body: JSON.stringify({
           model: 'gpt-4.1',
-          input: `Translate this into natural, polite ${targetLang} for a customer service phone call. Only return the ${targetLang} translation.\n\n${text}`,
+          input: `Translate this into natural, polite ${targetLang} for a customer service phone call. Only return the ${targetLang} translation.${businessContext ? `\n\nContext: ${businessContext}` : ''}\n\n${text}`,
         }),
       });
       const translateData = await translateRes.json();
@@ -289,7 +297,7 @@ wss.on('connection', (twilioWs) => {
               headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
               body: JSON.stringify({
                 model: 'gpt-4.1',
-                input: `Translate this from ${langName} into natural, clear English. Only return the translation.\n\n${transcript}`,
+                input: `Translate this from ${langName} into natural, clear English. Only return the translation.${businessContext ? `\n\nContext: ${businessContext}` : ''}\n\n${transcript}`,
               }),
             });
             const translateData = await translateRes.json();
