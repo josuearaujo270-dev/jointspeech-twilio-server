@@ -201,7 +201,11 @@ wss.on('connection', (twilioWs) => {
           const langCode = alt?.languages?.[0];
           const langName = LANGUAGE_NAMES[langCode] || null;
           const call = activeCalls.get(callSid);
-          if (call && langName) {
+          // Once a call locks onto a real foreign language, don't let a single stray
+          // English misdetection (numbers, names, short phrases often get heard as
+          // English) flip it back — only a genuinely different foreign language should.
+          const lockedToForeign = call?.languageName && call.languageName !== 'English';
+          if (call && langName && !(lockedToForeign && langName === 'English')) {
             call.languageCode = langCode;
             call.languageName = langName;
           }
