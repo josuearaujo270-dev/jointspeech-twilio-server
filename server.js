@@ -17,6 +17,17 @@ const LANGUAGE_NAMES = {
   ur: 'Urdu', fa: 'Farsi', ro: 'Romanian', nl: 'Dutch', el: 'Greek', uk: 'Ukrainian',
 };
 
+// Matches whatever Twilio's speech recognition heard (e.g. "Spanish", "I think French")
+// against our supported language names. Returns null if nothing recognizable was said.
+function matchLanguageName(spoken) {
+  if (!spoken) return null;
+  const lower = spoken.toLowerCase();
+  for (const name of Object.values(LANGUAGE_NAMES)) {
+    if (lower.includes(name.toLowerCase())) return name;
+  }
+  return null;
+}
+
 const app = express();
 
 // Allow the JointSpeech web app (running on a different domain) to poll these endpoints
@@ -37,15 +48,40 @@ const activeCalls = new Map();
 // "start" event arrives, then merged into activeCalls once we have a WS connection for it.
 const pendingCallMeta = new Map();
 
-// ── Twilio webhook: answers the call, opens a bidirectional media stream ──
+// ── Twilio webhook: answers the call, asks whoever connected to say the customer's
+// language (so we don't have to guess), then opens the bidirectional media stream ──
 app.post('/voice', (req, res) => {
   if (req.body?.CallSid) {
     pendingCallMeta.set(req.body.CallSid, { fromNumber: req.body.From || null });
   }
-  const wsUrl = `wss://${PUBLIC_HOST}/media`;
   res.type('text/xml');
   res.send(`<?xml version="1.0" encoding="UTF-8"?>
 <Response>
+  <Gather input="speech" speechTimeout="auto" action="/voice/language" method="POST">
+    <Say>JointSpeech connected. Please say the customer's language now.</Say>
+  </Gather>
+  <Redirect method="POST">/voice/language</Redirect>
+</Response>`);
+});
+
+app.post('/voice/language', (req, res) => {
+  const callSid = req.body?.CallSid;
+  const matchedLang = matchLanguageName(req.body?.SpeechResult);
+
+  if (callSid) {
+    const meta = pendingCallMeta.get(callSid) || {};
+    pendingCallMeta.set(callSid, { ...meta, presetLanguageName: matchedLang });
+  }
+
+  const wsUrl = `wss://${PUBLIC_HOST}/media`;
+  const confirmMsg = matchedLang
+    ? `Connecting you now for ${matchedLang}. Please speak in complete sentences.`
+    : `Connecting you now. Please speak in complete sentences.`;
+
+  res.type('text/xml');
+  res.send(`<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Say>${confirmMsg}</Say>
   <Connect>
     <Stream url="${wsUrl}" />
   </Connect>
@@ -199,16 +235,22 @@ wss.on('connection', (twilioWs) => {
           if (!transcript || !isFinal) return;
 
           const langCode = alt?.languages?.[0];
-          const langName = LANGUAGE_NAMES[langCode] || null;
+          const detectedLangName = LANGUAGE_NAMES[langCode] || null;
           const call = activeCalls.get(callSid);
-          // Once a call locks onto a real foreign language, don't let a single stray
-          // English misdetection (numbers, names, short phrases often get heard as
-          // English) flip it back — only a genuinely different foreign language should.
+          // Once a call locks onto a real foreign language (whether from the rep saying
+          // it up front, or from an earlier detection), don't let a single stray English
+          // misdetection (numbers, names, short phrases often get heard as English) flip
+          // it back — only a genuinely different foreign language should.
           const lockedToForeign = call?.languageName && call.languageName !== 'English';
-          if (call && langName && !(lockedToForeign && langName === 'English')) {
+          if (call && detectedLangName && !(lockedToForeign && detectedLangName === 'English')) {
             call.languageCode = langCode;
-            call.languageName = langName;
+            call.languageName = detectedLangName;
           }
+
+          // Short utterances often don't carry their own language tag — fall back to
+          // the call's known language (preset or previously locked) instead of skipping
+          // translation entirely.
+          const langName = detectedLangName || call?.languageName || null;
 
           // Translate to English via GPT (skip if already English)
           let translation = transcript;
@@ -252,7 +294,7 @@ wss.on('connection', (twilioWs) => {
           streamSid,
           startedAt: Date.now(),
           languageCode: null,
-          languageName: null,
+          languageName: meta?.presetLanguageName || null,
           fromNumber: meta?.fromNumber || null,
           transcriptLog: [],
           listeners: new Set(),
