@@ -51,6 +51,7 @@ const pendingCallMeta = new Map();
 // ── Twilio webhook: answers the call, asks whoever connected to say the customer's
 // language (so we don't have to guess), then opens the bidirectional media stream ──
 app.post('/voice', (req, res) => {
+  console.log(`[${req.body?.CallSid}] /voice hit, From=${req.body?.From}`);
   if (req.body?.CallSid) {
     pendingCallMeta.set(req.body.CallSid, { fromNumber: req.body.From || null });
   }
@@ -66,6 +67,7 @@ app.post('/voice', (req, res) => {
 
 app.post('/voice/language', (req, res) => {
   const callSid = req.body?.CallSid;
+  console.log(`[${callSid}] /voice/language hit, SpeechResult="${req.body?.SpeechResult}"`);
   const matchedLang = matchLanguageName(req.body?.SpeechResult);
 
   if (callSid) {
