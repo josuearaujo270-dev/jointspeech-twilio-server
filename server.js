@@ -55,15 +55,17 @@ app.post('/voice', (req, res) => {
   if (req.body?.CallSid) {
     pendingCallMeta.set(req.body.CallSid, { fromNumber: req.body.From || null });
   }
+  const wsUrl = `wss://${PUBLIC_HOST}/media`;
   res.type('text/xml');
   res.send(`<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Gather input="speech" speechTimeout="auto" action="/voice/language" method="POST">
-    <Say>JointSpeech connected. Please say the customer's language now.</Say>
-  </Gather>
-  <Redirect method="POST">/voice/language</Redirect>
+  <Connect>
+    <Stream url="${wsUrl}" />
+  </Connect>
 </Response>`);
 });
+
+// Kept for later — currently unused while the language IVR step is rolled back.
 
 app.post('/voice/language', (req, res) => {
   const callSid = req.body?.CallSid;
