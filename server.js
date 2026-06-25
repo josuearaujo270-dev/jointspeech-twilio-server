@@ -166,6 +166,7 @@ wss.on('connection', (twilioWs) => {
   let callSid = null;
   let streamSid = null;
   let deepgramWs = null;
+  let mediaCount = 0;
 
   twilioWs.on('message', async (raw) => {
     const msg = JSON.parse(raw.toString());
@@ -185,10 +186,16 @@ wss.on('connection', (twilioWs) => {
       deepgramWs.on('message', async (dgRaw) => {
         try {
           const dgMsg = JSON.parse(dgRaw.toString());
-          if (dgMsg.type !== 'Results') return;
+          if (dgMsg.type !== 'Results') {
+            console.log(`[${callSid}] Deepgram non-Results message: ${dgRaw.toString().slice(0, 200)}`);
+            return;
+          }
           const alt = dgMsg.channel?.alternatives?.[0];
           const transcript = alt?.transcript || '';
           const isFinal = dgMsg.is_final;
+          if (transcript) {
+            console.log(`[${callSid}] Deepgram Results (isFinal=${isFinal}): "${transcript}"`);
+          }
           if (!transcript || !isFinal) return;
 
           const langCode = alt?.languages?.[0];
@@ -225,6 +232,7 @@ wss.on('connection', (twilioWs) => {
       });
 
       deepgramWs.on('error', (err) => console.error(`[${callSid}] Deepgram error`, err));
+      deepgramWs.on('close', (code, reason) => console.log(`[${callSid}] Deepgram closed: code=${code} reason=${reason}`));
 
       // Preserve transcript history if this callSid somehow gets a second "start"
       // event (e.g. a media stream reconnect) instead of wiping it clean.
@@ -250,6 +258,10 @@ wss.on('connection', (twilioWs) => {
     }
 
     if (msg.event === 'media') {
+      mediaCount++;
+      if (mediaCount % 100 === 0) {
+        console.log(`[${callSid}] Received ${mediaCount} audio chunks so far, deepgramWs.readyState=${deepgramWs?.readyState}`);
+      }
       if (deepgramWs && deepgramWs.readyState === 1) {
         deepgramWs.send(Buffer.from(msg.media.payload, 'base64'));
       }
