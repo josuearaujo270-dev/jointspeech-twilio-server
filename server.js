@@ -165,7 +165,7 @@ app.post('/speak/:callSid', async (req, res) => {
         method: 'POST',
         headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          model: 'gpt-4.1',
+          model: 'gpt-4.1-mini',
           input: `Translate this into natural, polite ${targetLang} for a customer service phone call. Only return the ${targetLang} translation.${businessContext ? `\n\nContext: ${businessContext}` : ''}\n\n${text}`,
         }),
       });
@@ -296,7 +296,7 @@ wss.on('connection', (twilioWs) => {
               method: 'POST',
               headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
               body: JSON.stringify({
-                model: 'gpt-4.1',
+                model: 'gpt-4.1-mini',
                 input: `Translate this from ${langName} into natural, clear English. Only return the translation.${businessContext ? `\n\nContext: ${businessContext}` : ''}\n\n${transcript}`,
               }),
             });
