@@ -3,6 +3,17 @@ import { WebSocketServer } from 'ws';
 import http from 'http';
 import fetch from 'node-fetch';
 
+// A single uncaught error anywhere (a bad Twilio message, a transient fetch failure
+// mid-call, etc.) used to crash the whole process — Railway would restart the container,
+// and any call that came in during that gap got no webhook response at all (dead air).
+// Log and keep running instead; per-call try/catch below handles the call-level cleanup.
+process.on('uncaughtException', (err) => {
+  console.error('UNCAUGHT EXCEPTION (server staying up):', err);
+});
+process.on('unhandledRejection', (err) => {
+  console.error('UNHANDLED REJECTION (server staying up):', err);
+});
+
 const PORT = process.env.PORT || 8080;
 const DEEPGRAM_API_KEY = process.env.DEEPGRAM_API_KEY;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
@@ -158,7 +169,15 @@ async function speakIntoCall(call, text, voiceId) {
       headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({
         model: 'gpt-4.1-mini',
-        input: `Translate this into natural, polite ${targetLang} for a customer service phone call. Only return the ${targetLang} translation.${businessContext ? `\n\nContext: ${businessContext}` : ''}\n\n${text}`,
+        temperature: 0,
+        input: `Translate this into natural, polite ${targetLang} for a customer service phone call.
+
+Rules:
+- Translate literally and precisely. Never substitute a related or synonymous word for the actual word used (e.g. "library" must become the ${targetLang} word for library, not bookshelf, bookcase, or any near-synonym).
+- If unsure of a word's exact translation, pick its most literal correct meaning rather than guessing a related concept.
+- Only return the ${targetLang} translation. No explanation.
+${businessContext ? `\nContext: ${businessContext}\n` : ''}
+${text}`,
       }),
     });
     const translateData = await translateRes.json();
@@ -274,6 +293,7 @@ wss.on('connection', (twilioWs) => {
   let mediaCount = 0;
 
   twilioWs.on('message', async (raw) => {
+    try {
     const msg = JSON.parse(raw.toString());
 
     if (msg.event === 'start') {
@@ -329,7 +349,16 @@ wss.on('connection', (twilioWs) => {
               headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
               body: JSON.stringify({
                 model: 'gpt-4.1-mini',
-                input: `Translate this from ${langName} into natural, clear English. Only return the translation.${businessContext ? `\n\nContext: ${businessContext}` : ''}\n\n${transcript}`,
+                temperature: 0,
+                input: `Translate this from ${langName} into natural, clear English.
+
+Rules:
+- Translate literally and precisely. Never substitute a related or synonymous word for the actual word used (e.g. "biblioteca" must become "library", not "bookshelf" or "bookcase").
+- If unsure of a word's exact translation, pick its most literal correct meaning rather than guessing a related concept.
+- The input was captured by speech-to-text and may contain transcription errors — interpret the most likely intended meaning and translate that.
+- Only return the English translation. No explanation.
+${businessContext ? `\nContext: ${businessContext}\n` : ''}
+${transcript}`,
               }),
             });
             const translateData = await translateRes.json();
@@ -398,6 +427,9 @@ wss.on('connection', (twilioWs) => {
       console.log(`[${callSid}] Call ended`);
       if (deepgramWs) deepgramWs.close();
       finalizeCall(callSid);
+    }
+    } catch (err) {
+      console.error(`[${callSid}] Twilio message handling error (call continues):`, err);
     }
   });
 
