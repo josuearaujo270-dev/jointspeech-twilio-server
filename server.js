@@ -148,8 +148,78 @@ app.get('/calls/:callSid', (req, res) => {
   });
 });
 
-// ── Agent's app calls this to speak a reply into the live call ──
-// Agent always types in English; we translate to the customer's detected language before TTS.
+// Does the actual translate + TTS + push-to-call work for one chunk of agent speech/text.
+async function speakIntoCall(call, text, voiceId) {
+  let spokenText = text;
+  const targetLang = call.languageName;
+  if (targetLang && targetLang !== 'English') {
+    const translateRes = await fetch('https://api.openai.com/v1/responses', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: 'gpt-4.1-mini',
+        input: `Translate this into natural, polite ${targetLang} for a customer service phone call. Only return the ${targetLang} translation.${businessContext ? `\n\nContext: ${businessContext}` : ''}\n\n${text}`,
+      }),
+    });
+    const translateData = await translateRes.json();
+    spokenText = translateData.output?.[0]?.content?.[0]?.text || text;
+  }
+
+  const elRes = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${voiceId || '21m00Tcm4TlvDq8ikWAM'}?output_format=ulaw_8000`, {
+    method: 'POST',
+    headers: { 'xi-api-key': ELEVENLABS_API_KEY, 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      text: spokenText,
+      model_id: 'eleven_multilingual_v2',
+      voice_settings: { stability: 0.45, similarity_boost: 0.75, style: 0.3, use_speaker_boost: true },
+    }),
+  });
+  if (!elRes.ok) {
+    const err = await elRes.text();
+    throw new Error(`TTS failed: ${err}`);
+  }
+  const audioBuffer = Buffer.from(await elRes.arrayBuffer());
+  const base64Audio = audioBuffer.toString('base64');
+
+  call.twilioWs.send(JSON.stringify({
+    event: 'media',
+    streamSid: call.streamSid,
+    media: { payload: base64Audio },
+  }));
+
+  call.transcriptLog.push({ speaker: 'agent', transcript: text, translation: spokenText, time: Date.now() });
+  return spokenText;
+}
+
+// Chunks (one per dictated sentence, fired as soon as each is finalized) land here
+// out of order relative to how long their own translate+TTS calls take. Queue them
+// per-call so audio always reaches Twilio in the order the agent actually said it.
+function enqueueSpeak(call, text, voiceId) {
+  return new Promise((resolve, reject) => {
+    call.speakQueue.push({ text, voiceId, resolve, reject });
+    processSpeakQueue(call);
+  });
+}
+
+async function processSpeakQueue(call) {
+  if (call.speaking) return;
+  const job = call.speakQueue.shift();
+  if (!job) return;
+  call.speaking = true;
+  try {
+    job.resolve(await speakIntoCall(call, job.text, job.voiceId));
+  } catch (err) {
+    job.reject(err);
+  } finally {
+    call.speaking = false;
+    processSpeakQueue(call);
+  }
+}
+
+// ── Agent's app calls this to speak a reply (or one dictated chunk of a reply) into
+// the live call. Agent always speaks/types in English; we translate to the customer's
+// detected language before TTS. Requests are queued per-call (see above) so rapid-fire
+// chunks from live dictation play back-to-back instead of racing each other.
 app.post('/speak/:callSid', async (req, res) => {
   const { callSid } = req.params;
   const { text, voiceId } = req.body;
@@ -158,45 +228,7 @@ app.post('/speak/:callSid', async (req, res) => {
   if (!text || !text.trim()) return res.status(400).json({ error: 'No text provided' });
 
   try {
-    let spokenText = text;
-    const targetLang = call.languageName;
-    if (targetLang && targetLang !== 'English') {
-      const translateRes = await fetch('https://api.openai.com/v1/responses', {
-        method: 'POST',
-        headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          model: 'gpt-4.1-mini',
-          input: `Translate this into natural, polite ${targetLang} for a customer service phone call. Only return the ${targetLang} translation.${businessContext ? `\n\nContext: ${businessContext}` : ''}\n\n${text}`,
-        }),
-      });
-      const translateData = await translateRes.json();
-      spokenText = translateData.output?.[0]?.content?.[0]?.text || text;
-    }
-
-    const elRes = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${voiceId || '21m00Tcm4TlvDq8ikWAM'}?output_format=ulaw_8000`, {
-      method: 'POST',
-      headers: { 'xi-api-key': ELEVENLABS_API_KEY, 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        text: spokenText,
-        model_id: 'eleven_multilingual_v2',
-        voice_settings: { stability: 0.45, similarity_boost: 0.75, style: 0.3, use_speaker_boost: true },
-      }),
-    });
-    if (!elRes.ok) {
-      const err = await elRes.text();
-      return res.status(500).json({ error: `TTS failed: ${err}` });
-    }
-    const audioBuffer = Buffer.from(await elRes.arrayBuffer());
-    const base64Audio = audioBuffer.toString('base64');
-
-    call.twilioWs.send(JSON.stringify({
-      event: 'media',
-      streamSid: call.streamSid,
-      media: { payload: base64Audio },
-    }));
-
-    call.transcriptLog.push({ speaker: 'agent', transcript: text, translation: spokenText, time: Date.now() });
-
+    const spokenText = await enqueueSpeak(call, text, voiceId);
     res.json({ ok: true, spokenText });
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -337,6 +369,8 @@ wss.on('connection', (twilioWs) => {
           fromNumber: meta?.fromNumber || null,
           transcriptLog: [],
           listeners: new Set(),
+          speakQueue: [],
+          speaking: false,
         });
       }
       console.log(`[${callSid}] Call started, streamSid=${streamSid}`);
