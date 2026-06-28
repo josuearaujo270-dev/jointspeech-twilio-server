@@ -184,12 +184,17 @@ ${text}`,
     spokenText = translateData.output?.[0]?.content?.[0]?.text || text;
   }
 
-  const elRes = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${voiceId || '21m00Tcm4TlvDq8ikWAM'}?output_format=ulaw_8000`, {
+  // /stream + forwarding chunks as they arrive (instead of awaiting the whole clip,
+  // then sending one big payload) means the call starts hearing audio as soon as the
+  // first bytes are synthesized. eleven_flash_v2_5 is ElevenLabs' low-latency model
+  // built for exactly this — real-time conversational use — instead of the higher
+  // quality but noticeably slower eleven_multilingual_v2.
+  const elRes = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${voiceId || '21m00Tcm4TlvDq8ikWAM'}/stream?output_format=ulaw_8000`, {
     method: 'POST',
     headers: { 'xi-api-key': ELEVENLABS_API_KEY, 'Content-Type': 'application/json' },
     body: JSON.stringify({
       text: spokenText,
-      model_id: 'eleven_multilingual_v2',
+      model_id: 'eleven_flash_v2_5',
       voice_settings: { stability: 0.45, similarity_boost: 0.75, style: 0.3, use_speaker_boost: true },
     }),
   });
@@ -197,14 +202,13 @@ ${text}`,
     const err = await elRes.text();
     throw new Error(`TTS failed: ${err}`);
   }
-  const audioBuffer = Buffer.from(await elRes.arrayBuffer());
-  const base64Audio = audioBuffer.toString('base64');
-
-  call.twilioWs.send(JSON.stringify({
-    event: 'media',
-    streamSid: call.streamSid,
-    media: { payload: base64Audio },
-  }));
+  for await (const chunk of elRes.body) {
+    call.twilioWs.send(JSON.stringify({
+      event: 'media',
+      streamSid: call.streamSid,
+      media: { payload: Buffer.from(chunk).toString('base64') },
+    }));
+  }
 
   call.transcriptLog.push({ speaker: 'agent', transcript: text, translation: spokenText, time: Date.now() });
   return spokenText;
