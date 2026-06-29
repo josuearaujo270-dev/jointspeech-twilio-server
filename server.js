@@ -2,6 +2,7 @@ import express from 'express';
 import { WebSocketServer } from 'ws';
 import http from 'http';
 import fetch from 'node-fetch';
+import { createClient } from '@supabase/supabase-js';
 
 // A single uncaught error anywhere (a bad Twilio message, a transient fetch failure
 // mid-call, etc.) used to crash the whole process — Railway would restart the container,
@@ -20,6 +21,25 @@ const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY;
 const PUBLIC_HOST = process.env.PUBLIC_HOST; // e.g. jointspeech-twilio.up.railway.app
 const APP_CALLBACK_URL = process.env.APP_CALLBACK_URL; // e.g. https://jointspeech.com/api/twilio/save-call
+
+const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
+
+// Looks up which business owns a given Twilio number so each call uses that business's
+// own context/owner instead of one shared global config — this is what lets multiple
+// businesses run on the same server without seeing each other's calls.
+async function getBusinessByNumber(phoneNumber) {
+  if (!phoneNumber) return null;
+  const { data, error } = await supabase
+    .from('businesses')
+    .select('owner_user_id, business_name, business_context')
+    .eq('phone_number', phoneNumber)
+    .maybeSingle();
+  if (error) {
+    console.error('Business lookup failed:', error.message);
+    return null;
+  }
+  return data;
+}
 
 const LANGUAGE_NAMES = {
   en: 'English', es: 'Spanish', fr: 'French', pt: 'Portuguese', zh: 'Chinese',
@@ -78,24 +98,41 @@ app.use(express.json());
 // callSid -> { twilioWs, streamSid, startedAt, languageCode, languageName, fromNumber, transcriptLog: [] }
 const activeCalls = new Map();
 
-// Single-tenant for now — the web app pushes the agent's business context here so phone
-// call translations can use it the same way the main app's translations already do.
-let businessContext = '';
-app.post('/context', (req, res) => {
-  businessContext = typeof req.body?.businessContext === 'string' ? req.body.businessContext : '';
+// The web app pushes the signed-in business's context here, scoped by their own
+// owner_user_id, so it lands on the right row instead of one shared global value.
+app.post('/context', async (req, res) => {
+  const { ownerId, businessContext } = req.body || {};
+  if (!ownerId) return res.status(400).json({ error: 'Missing ownerId' });
+  const { error } = await supabase
+    .from('businesses')
+    .update({ business_context: typeof businessContext === 'string' ? businessContext : '' })
+    .eq('owner_user_id', ownerId);
+  if (error) return res.status(500).json({ error: error.message });
   res.json({ ok: true });
 });
 
-// callSid -> { fromNumber } — captured from the /voice webhook before the media stream's
-// "start" event arrives, then merged into activeCalls once we have a WS connection for it.
+// callSid -> { fromNumber, ownerId, businessName, businessContext } — captured from the
+// /voice webhook before the media stream's "start" event arrives, then merged into
+// activeCalls once we have a WS connection for it.
 const pendingCallMeta = new Map();
 
 // ── Twilio webhook: answers the call, asks whoever connected to say the customer's
 // language (so we don't have to guess), then opens the bidirectional media stream ──
-app.post('/voice', (req, res) => {
-  console.log(`[${req.body?.CallSid}] /voice hit, From=${req.body?.From}`);
-  if (req.body?.CallSid) {
-    pendingCallMeta.set(req.body.CallSid, { fromNumber: req.body.From || null });
+app.post('/voice', async (req, res) => {
+  const callSid = req.body?.CallSid;
+  const toNumber = req.body?.To;
+  console.log(`[${callSid}] /voice hit, From=${req.body?.From}, To=${toNumber}`);
+  if (callSid) {
+    const business = await getBusinessByNumber(toNumber);
+    pendingCallMeta.set(callSid, {
+      fromNumber: req.body.From || null,
+      ownerId: business?.owner_user_id || null,
+      businessName: business?.business_name || null,
+      businessContext: business?.business_context || '',
+    });
+    if (!business) {
+      console.error(`[${callSid}] No business found for number ${toNumber} — call will run with no context/owner`);
+    }
   }
   res.type('text/xml');
   res.send(`<?xml version="1.0" encoding="UTF-8"?>
@@ -136,21 +173,28 @@ app.post('/voice/language', (req, res) => {
 </Response>`);
 });
 
-// ── Agent dashboard: list calls currently in progress ──
+// ── Agent dashboard: list calls currently in progress for the signed-in business only ──
 app.get('/calls', (req, res) => {
-  const calls = Array.from(activeCalls.entries()).map(([callSid, call]) => ({
-    callSid,
-    startedAt: call.startedAt,
-    languageName: call.languageName || 'Detecting…',
-    lastTranscript: call.transcriptLog.length ? call.transcriptLog[call.transcriptLog.length - 1] : null,
-  }));
+  const { ownerId } = req.query;
+  if (!ownerId) return res.status(400).json({ error: 'Missing ownerId' });
+  const calls = Array.from(activeCalls.entries())
+    .filter(([, call]) => call.ownerId === ownerId)
+    .map(([callSid, call]) => ({
+      callSid,
+      startedAt: call.startedAt,
+      languageName: call.languageName || 'Detecting…',
+      lastTranscript: call.transcriptLog.length ? call.transcriptLog[call.transcriptLog.length - 1] : null,
+    }));
   res.json({ calls });
 });
 
-// ── Agent dashboard: full live transcript for one call ──
+// ── Agent dashboard: full live transcript for one call — 404s for both "call doesn't
+// exist" and "call exists but isn't yours" so this can't be used to probe other calls ──
 app.get('/calls/:callSid', (req, res) => {
   const call = activeCalls.get(req.params.callSid);
-  if (!call) return res.status(404).json({ error: 'Call not found or already ended' });
+  if (!call || call.ownerId !== req.query.ownerId) {
+    return res.status(404).json({ error: 'Call not found or already ended' });
+  }
   res.json({
     callSid: req.params.callSid,
     startedAt: call.startedAt,
@@ -176,7 +220,7 @@ Rules:
 - Translate literally and precisely. Never substitute a related or synonymous word for the actual word used (e.g. "library" must become the ${targetLang} word for library, not bookshelf, bookcase, or any near-synonym).
 - If unsure of a word's exact translation, pick its most literal correct meaning rather than guessing a related concept.
 - Only return the ${targetLang} translation. No explanation.
-${businessContext ? `\nContext: ${businessContext}\n` : ''}
+${call.businessContext ? `\nContext: ${call.businessContext}\n` : ''}
 ${text}`,
       }),
     });
@@ -361,7 +405,7 @@ Rules:
 - If unsure of a word's exact translation, pick its most literal correct meaning rather than guessing a related concept.
 - The input was captured by speech-to-text and may contain transcription errors — interpret the most likely intended meaning and translate that.
 - Only return the English translation. No explanation.
-${businessContext ? `\nContext: ${businessContext}\n` : ''}
+${call?.businessContext ? `\nContext: ${call.businessContext}\n` : ''}
 ${transcript}`,
               }),
             });
@@ -400,6 +444,9 @@ ${transcript}`,
           languageCode: null,
           languageName: meta?.presetLanguageName || null,
           fromNumber: meta?.fromNumber || null,
+          ownerId: meta?.ownerId || null,
+          businessName: meta?.businessName || null,
+          businessContext: meta?.businessContext || '',
           transcriptLog: [],
           listeners: new Set(),
           speakQueue: [],
@@ -465,6 +512,7 @@ async function finalizeCall(callSid) {
       body: JSON.stringify({
         callSid,
         fromNumber: call.fromNumber,
+        ownerId: call.ownerId,
         languageName: call.languageName,
         startedAt: call.startedAt,
         endedAt: Date.now(),
